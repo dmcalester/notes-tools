@@ -1,0 +1,12 @@
+# logs
+*.log*
+
+# environment variables
+*.env*
+
+# macOS-specific files
+.DS_Store
+
+# Notes database copy
+_ignore/
+_ai/
