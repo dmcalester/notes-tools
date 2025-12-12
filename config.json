@@ -1,8 +1,8 @@
 {
    "notesFolderName": "test",
-   "templateDirectory": "./templates",
-   "outputDirectory": "./site",
+   "templateDirectory": "./sample//templates",
+   "outputDirectory": "./sample/site",
    "siteTitle": "My Site",
-   "siteUrl": "https://example.com",
+   "siteUrl": "https://sample.com",
    "siteDescription": "Notes from the field"
 }

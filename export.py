@@ -1,518 +1,660 @@
 #!/usr/bin/env python3
 
 """
-Export notes from Notes.app to static HTML blog posts.
+Query Apple Notes SQLite database directly.
 
-A spiritual successor to Markdown - authoring in Notes.app with minimal markup,
-exporting to clean HTML with support for [[wiki links]], footnotes, and RSS.
+This script reads notes from the Notes.app SQLite database, extracting
+note content and metadata. The note body is stored as gzip-compressed
+protobuf data which we parse to extract text and formatting information.
 """
 
 import argparse
+import gzip
 import json
 import os
-import re
-import subprocess
-import sys
-from datetime import datetime
+import sqlite3
+import struct
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
+
+# Apple's Core Data timestamp epoch (Jan 1, 2001)
+APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+# Notes database path
+NOTES_DB_PATH = os.path.expanduser(
+    "~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
+)
 
 
-# --- Configuration ---
-
-def load_config(config_path=None, cli_args=None):
-    """Load configuration from file and merge with CLI arguments."""
+def load_config(config_path=None):
+    """Load configuration from file."""
     config = {
-        'notesFolderName': 'test',
-        'templateDirectory': './templates',
-        'outputDirectory': './output',
-        'siteTitle': 'My Blog',
-        'siteUrl': 'https://example.com',
-        'siteDescription': 'Notes from the field'
+        "notesFolderName": "test",
     }
-    
-    # Try to find config file
+
     if config_path:
         config_file = Path(config_path)
     else:
-        # Check script directory first, then current working directory
         script_dir = Path(__file__).parent
-        if (script_dir / 'config.json').exists():
-            config_file = script_dir / 'config.json'
-        elif Path('config.json').exists():
-            config_file = Path('config.json')
+        if (script_dir / "config.json").exists():
+            config_file = script_dir / "config.json"
+        elif Path("config.json").exists():
+            config_file = Path("config.json")
         else:
             config_file = None
-    
-    # Load config file if found
+
     if config_file and config_file.exists():
-        with open(config_file, 'r') as f:
+        with open(config_file, "r") as f:
             file_config = json.load(f)
             config.update(file_config)
-    
-    # Override with CLI arguments
-    if cli_args:
-        if cli_args.folder:
-            config['notesFolderName'] = cli_args.folder
-        if cli_args.templates:
-            config['templateDirectory'] = cli_args.templates
-        if cli_args.output:
-            config['outputDirectory'] = cli_args.output
-        if cli_args.site_url:
-            config['siteUrl'] = cli_args.site_url
-        if cli_args.site_title:
-            config['siteTitle'] = cli_args.site_title
-        if cli_args.site_description:
-            config['siteDescription'] = cli_args.site_description
-    
+
     return config
 
 
-# --- Dependency Check ---
+def apple_timestamp_to_datetime(timestamp: float) -> datetime:
+    """Convert Apple Core Data timestamp to datetime."""
+    if timestamp is None:
+        return None
+    from datetime import timedelta
 
-def check_dependencies():
-    """Verify osascript is available."""
-    if not Path('/usr/bin/osascript').exists():
-        print("Error: osascript not found. This script requires macOS.", file=sys.stderr)
-        sys.exit(1)
-
-
-# --- Notes.app Bridge ---
-
-def get_notes_from_folder(folder_name):
-    """Fetch all notes from specified Notes.app folder via JXA (JavaScript for Automation)."""
-    # Use JXA to get notes and output as JSON for easy parsing
-    script = f'''
-        const app = Application("Notes");
-        const notes = [];
-        
-        for (const account of app.accounts()) {{
-            for (const folder of account.folders()) {{
-                if (folder.name() === "{folder_name}") {{
-                    for (const note of folder.notes()) {{
-                        notes.push({{
-                            name: note.name(),
-                            body: note.body(),
-                            creationDate: note.creationDate().toISOString()
-                        }});
-                    }}
-                }}
-            }}
-        }}
-        
-        JSON.stringify(notes);
-    '''
-    
-    try:
-        result = subprocess.run(
-            ['osascript', '-l', 'JavaScript', '-e', script],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        
-        # Parse JSON output
-        output = result.stdout.strip()
-        if not output or output == '':
-            return []
-        
-        notes_data = json.loads(output)
-        
-        # Convert ISO date strings to datetime objects
-        for note in notes_data:
-            note['creationDate'] = datetime.fromisoformat(note['creationDate'].replace('Z', '+00:00'))
-        
-        return notes_data
-        
-    except subprocess.CalledProcessError as e:
-        print(f"Error: Failed to fetch notes from Notes.app", file=sys.stderr)
-        print(f"Details: {e.stderr}", file=sys.stderr)
-        sys.exit(1)
-    except json.JSONDecodeError as e:
-        print(f"Error: Failed to parse notes data", file=sys.stderr)
-        print(f"Details: {e}", file=sys.stderr)
-        sys.exit(1)
+    return APPLE_EPOCH + timedelta(seconds=timestamp)
 
 
-# --- Helper Functions ---
+# Paragraph style types (from protobuf attribute a1)
+PARA_STYLE_NORMAL = 0
+PARA_STYLE_TITLE = 1  # H1
+PARA_STYLE_HEADING = 2  # H2
+PARA_STYLE_SUBHEADING = 4  # H3 / Monospaced in some contexts
+PARA_STYLE_MONO = 5  # Monospaced/code
+PARA_STYLE_BULLET_LIST = 100  # Bulleted list (•)
+PARA_STYLE_DASH_LIST = 101  # Dashed list (-)
+PARA_STYLE_NUMBER_LIST = 102  # Numbered list (1. 2. 3.)
 
-def generate_slug(title, creation_date):
-    """Generate URL slug from title and date: YYYY/MM/title-slug"""
-    year = creation_date.strftime('%Y')
-    month = creation_date.strftime('%m')
-    
-    # Clean title for URL
-    title_slug = title.lower()
-    title_slug = re.sub(r'[^a-z0-9\s]', '', title_slug)
-    title_slug = re.sub(r'\s+', '-', title_slug)
-    
-    return f"{year}/{month}/{title_slug}"
-
-
-def format_date(dt):
-    """Format date for display: January 1, 2025"""
-    return dt.strftime('%B %d, %Y').replace(' 0', ' ')  # Remove leading zero from day
+# Text style values (from protobuf field 5 at style run level)
+TEXT_STYLE_NORMAL = 0
+TEXT_STYLE_BOLD = 1
+TEXT_STYLE_ITALIC = 2
 
 
-def format_datetime(dt):
-    """Format datetime for HTML datetime attribute: ISO 8601"""
-    return dt.isoformat()
+@dataclass
+class StyleRun:
+    """A run of text with associated formatting."""
 
+    start: int
+    length: int
+    text: str
+    # Formatting attributes
+    paragraph_style: int = 0  # PARA_STYLE_* constants
+    text_style: int = 0  # TEXT_STYLE_* (bold/italic)
+    is_blockquote: bool = False
+    is_superscript: bool = False  # Field 8 at style run level
+    is_underline: bool = False
+    is_strikethrough: bool = False
+    link_url: Optional[str] = None
 
-def format_rfc822_date(dt):
-    """Format datetime for RSS pubDate: RFC 822"""
-    return dt.strftime('%a, %d %b %Y %H:%M:%S +0000')
+    @property
+    def is_bold(self) -> bool:
+        return self.text_style == TEXT_STYLE_BOLD
 
+    @property
+    def is_italic(self) -> bool:
+        return self.text_style == TEXT_STYLE_ITALIC
 
-# --- HTML Transformation Functions ---
-
-def clean_html(html):
-    """Clean Apple Notes HTML to standard HTML."""
-    c = html
-    
-    # Replace <tt> with <code>
-    c = re.sub(r'<tt>', '<code>', c)
-    c = re.sub(r'</tt>', '</code>', c)
-    
-    # Remove Apple-dash-list class
-    c = re.sub(r'<ul class="Apple-dash-list">', '<ul>', c)
-    
-    # Strip inline styles from table elements
-    c = re.sub(r'<table[^>]*>', '<table>', c)
-    c = re.sub(r'<td[^>]*>', '<td>', c)
-    c = re.sub(r'<tr[^>]*>', '<tr>', c)
-    c = re.sub(r'<tbody[^>]*>', '<tbody>', c)
-    
-    # Remove <object> wrappers
-    c = re.sub(r'<object>', '', c)
-    c = re.sub(r'</object>', '', c)
-    
-    # Convert divs to content with newlines
-    c = re.sub(r'<div><br></div>', '\n', c)
-    c = re.sub(r'<div>', '', c)
-    c = re.sub(r'</div>', '\n', c)
-    
-    # Clean table cells
-    c = re.sub(r'<td>\n*', '<td>', c)
-    c = re.sub(r'\n*</td>', '</td>', c)
-    
-    # Convert <br> to newlines
-    c = re.sub(r'<br>', '\n', c)
-    
-    # Clean up excess newlines
-    c = re.sub(r'\n{3,}', '\n\n', c)
-    
-    return c.strip()
-
-
-def wrap_paragraphs(html):
-    """Wrap bare text in <p> tags, preserving block elements."""
-    block_tags = re.compile(r'^<(h[1-6]|ul|ol|li|table|thead|tbody|tr|td|th|blockquote|pre|code|header|footer|article|section|nav|aside|figure|figcaption)', re.IGNORECASE)
-    closing_block = re.compile(r'^</(h[1-6]|ul|ol|li|table|thead|tbody|tr|td|th|blockquote|pre|code|header|footer|article|section|nav|aside|figure|figcaption)', re.IGNORECASE)
-    
-    lines = html.split('\n')
-    result = []
-    in_block = 0
-    buffer = []
-    
-    def flush_buffer():
-        if buffer:
-            text = ' '.join(buffer).strip()
-            if text:
-                result.append(f'<p>{text}</p>')
-            buffer.clear()
-    
-    for line in lines:
-        trimmed = line.strip()
-        if not trimmed:
-            flush_buffer()
-            continue
-        
-        if block_tags.match(trimmed):
-            flush_buffer()
-            result.append(trimmed)
-            if not re.search(r'</[^>]+>\s*$', trimmed):
-                in_block += 1
-        elif closing_block.match(trimmed):
-            flush_buffer()
-            result.append(trimmed)
-            in_block = max(0, in_block - 1)
-        elif in_block > 0:
-            result.append(trimmed)
-        else:
-            buffer.append(trimmed)
-    
-    flush_buffer()
-    return '\n'.join(result)
-
-
-def resolve_links(html, note_lookup):
-    """Replace [[Note Title]] with <a href="/slug.html">Note Title</a>"""
-    def replace_link(match):
-        title = match.group(1)
-        if title in note_lookup:
-            slug = note_lookup[title]['slug']
-            return f'<a href="/{slug}.html">{title}</a>'
-        else:
-            print(f"Warning: Note not found: [[{title}]]", file=sys.stderr)
-            return title
-    
-    return re.sub(r'\[\[([^\]]+)\]\]', replace_link, html)
-
-
-def process_footnotes(html, slug):
-    """Process footnote references and definitions."""
-    definitions = {}
-    
-    # Extract footnote definitions: [^n]: text or [^n] text
-    def extract_definition(match):
-        num = match.group(1)
-        text = match.group(2)
-        definitions[num] = text.strip()
-        return ''
-    
-    content = re.sub(r'^\[\^(\d+)\]:?\s+(.+?)$', extract_definition, html, flags=re.MULTILINE)
-    
-    # Replace footnote references [^n]
-    def replace_reference(match):
-        num = match.group(1)
-        anchor_id = f"{slug}--footnote-{num}--anchor"
-        target_id = f"{slug}--footnote-{num}"
-        return f'<a id="{anchor_id}" href="#{target_id}"><sup>{num}</sup></a>'
-    
-    content = re.sub(r'\[\^(\d+)\]', replace_reference, content)
-    
-    # Build footer if there are definitions
-    footer = ''
-    if definitions:
-        nums = sorted(definitions.keys(), key=int)
-        footer = '<footer>\n<ol>\n'
-        for num in nums:
-            def_id = f"{slug}--footnote-{num}"
-            anchor_id = f"{slug}--footnote-{num}--anchor"
-            footer += f'<li id="{def_id}">{definitions[num]}<a href="#{anchor_id}">↩︎</a></li>\n'
-        footer += '</ol>\n</footer>'
-    
-    return {'content': content.strip(), 'footer': footer}
-
-
-# --- Template Engine ---
-
-def load_template(template_dir, name):
-    """Load template file."""
-    template_path = Path(template_dir) / f"{name}.html"
-    
-    if name == 'feed':
-        template_path = Path(template_dir) / "feed.xml"
-    
-    if not template_path.exists():
-        print(f"Error: Template not found: {template_path}", file=sys.stderr)
-        sys.exit(1)
-    
-    with open(template_path, 'r') as f:
-        return f.read()
-
-
-def render_template(template, variables):
-    """Render template with {{variable}} substitution."""
-    result = template
-    for key, value in variables.items():
-        result = result.replace(f'{{{{{key}}}}}', str(value))
-    return result
-
-
-# --- Note Lookup Builder ---
-
-def build_note_lookup(notes):
-    """Build title -> {slug, date} lookup for link resolution."""
-    lookup = {}
-    for note in notes:
-        title = note['name']
-        creation_date = note['creationDate']
-        slug = generate_slug(title, creation_date)
-        lookup[title] = {
-            'slug': slug,
-            'creationDate': creation_date
+    @property
+    def style_name(self) -> str:
+        """Human-readable paragraph style name."""
+        names = {
+            PARA_STYLE_TITLE: "title",
+            PARA_STYLE_HEADING: "heading",
+            PARA_STYLE_SUBHEADING: "subheading",
+            PARA_STYLE_MONO: "monospace",
+            PARA_STYLE_BULLET_LIST: "bullet-list",
+            PARA_STYLE_DASH_LIST: "dash-list",
+            PARA_STYLE_NUMBER_LIST: "number-list",
         }
-    return lookup
+        return names.get(self.paragraph_style, "normal")
 
 
-# --- RSS Generation ---
+@dataclass
+class NoteLink:
+    """An internal link to another note."""
 
-def generate_rss_items(posts, site_url):
-    """Generate RSS item elements for posts."""
-    items = []
-    
-    # Take 30 most recent (same as index)
-    recent_posts = sorted(posts, key=lambda p: p['creationDate'], reverse=True)[:30]
-    
-    for post in recent_posts:
-        title = post['title']
-        link = f"{site_url}/{post['slug']}.html"
-        pub_date = format_rfc822_date(post['creationDate'])
-        content = post['content']
-        
-        # Escape content for CDATA (just in case)
-        content = content.replace(']]>', ']]]]><![CDATA[>')
-        
-        item = f'''<item>
-  <title>{title}</title>
-  <link>{link}</link>
-  <pubDate>{pub_date}</pubDate>
-  <description><![CDATA[{content}]]></description>
-  <guid>{link}</guid>
-</item>'''
-        items.append(item)
-    
-    return '\n'.join(items)
+    url: str  # applenotes:note/UUID?ownerIdentifier=...
+    note_id: str  # UUID portion
+    text: str = ""  # The linked text
 
 
-# --- File Writing ---
+@dataclass
+class ParsedNote:
+    """Parsed note content with extracted formatting."""
 
-def write_article(slug, content, output_dir):
-    """Write article HTML to file, creating directories as needed."""
-    filepath = Path(output_dir) / f"{slug}.html"
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(filepath, 'w') as f:
-        f.write(content)
-
-
-def write_index(content, output_dir):
-    """Write index.html to output directory."""
-    filepath = Path(output_dir) / "index.html"
-    
-    with open(filepath, 'w') as f:
-        f.write(content)
+    title: str
+    text_content: str
+    style_runs: list  # List of StyleRun with formatting info
+    note_links: list  # List of NoteLink (internal links)
+    raw_data: bytes
 
 
-def write_feed(content, output_dir):
-    """Write feed.xml to output directory."""
-    filepath = Path(output_dir) / "feed.xml"
-    
-    with open(filepath, 'w') as f:
-        f.write(content)
+class ProtobufParser:
+    """Simple protobuf wire format parser for Notes data."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.pos = 0
+
+    def read_varint(self) -> int:
+        """Read a variable-length integer."""
+        result = 0
+        shift = 0
+        while True:
+            if self.pos >= len(self.data):
+                raise ValueError("Unexpected end of data while reading varint")
+            byte = self.data[self.pos]
+            self.pos += 1
+            result |= (byte & 0x7F) << shift
+            if (byte & 0x80) == 0:
+                break
+            shift += 7
+        return result
+
+    def read_bytes(self, length: int) -> bytes:
+        """Read a fixed number of bytes."""
+        if self.pos + length > len(self.data):
+            raise ValueError("Unexpected end of data while reading bytes")
+        result = self.data[self.pos : self.pos + length]
+        self.pos += length
+        return result
+
+    def read_field(self):
+        """Read a protobuf field (tag + value)."""
+        if self.pos >= len(self.data):
+            return None, None, None
+
+        tag_wire = self.read_varint()
+        field_number = tag_wire >> 3
+        wire_type = tag_wire & 0x07
+
+        if wire_type == 0:  # Varint
+            value = self.read_varint()
+        elif wire_type == 1:  # 64-bit
+            value = struct.unpack("<Q", self.read_bytes(8))[0]
+        elif wire_type == 2:  # Length-delimited
+            length = self.read_varint()
+            value = self.read_bytes(length)
+        elif wire_type == 5:  # 32-bit
+            value = struct.unpack("<I", self.read_bytes(4))[0]
+        else:
+            raise ValueError(f"Unknown wire type: {wire_type}")
+
+        return field_number, wire_type, value
+
+    def parse_all(self) -> list:
+        """Parse all fields from the data."""
+        fields = []
+        while self.pos < len(self.data):
+            try:
+                field_num, wire_type, value = self.read_field()
+                if field_num is None:
+                    break
+                fields.append((field_num, wire_type, value))
+            except ValueError:
+                break
+        return fields
 
 
-# --- Main Orchestration ---
+def extract_strings_from_protobuf(data: bytes) -> list:
+    """Extract all string fields from protobuf data recursively."""
+    strings = []
+
+    def try_parse(d: bytes, depth=0):
+        if depth > 10 or len(d) < 2:
+            return
+        try:
+            parser = ProtobufParser(d)
+            fields = parser.parse_all()
+            for field_num, wire_type, value in fields:
+                if wire_type == 2 and isinstance(value, bytes):
+                    # Try to decode as UTF-8 string
+                    try:
+                        s = value.decode("utf-8")
+                        if (
+                            s
+                            and len(s) > 0
+                            and all(c.isprintable() or c in "\n\t" for c in s)
+                        ):
+                            strings.append((field_num, s))
+                    except UnicodeDecodeError:
+                        pass
+                    # Recursively parse nested messages
+                    try_parse(value, depth + 1)
+        except (ValueError, struct.error):
+            pass
+
+    try_parse(data)
+    return strings
+
+
+def parse_all_fields(data: bytes) -> list:
+    """Parse all protobuf fields from data."""
+    parser = ProtobufParser(data)
+    return parser.parse_all()
+
+
+def get_note_content_fields(data: bytes):
+    """
+    Navigate to the note content section of the protobuf.
+
+    Structure:
+    - Field 1: version (varint)
+    - Field 2: Document message containing:
+      - Field 1: version (varint)
+      - Field 2: unused (varint)
+      - Field 3: Note content message
+
+    Returns the parsed fields of the Note content message.
+    """
+    root_fields = parse_all_fields(data)
+
+    # Find field 2 (Document)
+    for field_num, wire_type, value in root_fields:
+        if field_num == 2 and wire_type == 2:
+            doc_fields = parse_all_fields(value)
+
+            # Find field 3 (Note content)
+            for doc_field_num, doc_wire_type, doc_value in doc_fields:
+                if doc_field_num == 3 and doc_wire_type == 2:
+                    return parse_all_fields(doc_value)
+    return []
+
+
+def extract_main_text(data: bytes) -> str:
+    """Extract the main text content from Notes protobuf."""
+    note_fields = get_note_content_fields(data)
+
+    for field_num, wire_type, value in note_fields:
+        if field_num == 2 and wire_type == 2:
+            try:
+                return value.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+    return ""
+
+
+def extract_style_runs(data: bytes, text: str) -> list:
+    """
+    Extract formatting/style runs from Notes protobuf.
+
+    Style information is in Field 5 of the note content.
+    Each style run contains:
+    - Field 1: length of this run
+    - Field 2: character attributes
+      - a1: paragraph style (title, heading, list type, etc.)
+      - a8: blockquote flag
+    - Field 5: text style (1=bold, 2=italic)
+    - Field 9: link URL
+    """
+    note_fields = get_note_content_fields(data)
+
+    style_runs = []
+    pos = 0
+
+    for field_num, wire_type, value in note_fields:
+        if field_num == 5 and wire_type == 2:
+            style_fields = parse_all_fields(value)
+
+            run = {
+                "length": 0,
+                "para_style": 0,
+                "text_style": 0,
+                "is_blockquote": False,
+                "is_superscript": False,
+                "is_underline": False,
+                "is_strikethrough": False,
+                "link_url": None,
+            }
+
+            for sfn, swt, sval in style_fields:
+                if sfn == 1:  # Length
+                    run["length"] = sval
+                elif sfn == 2:  # Character attributes
+                    attrs = parse_all_fields(sval)
+                    for afn, awt, aval in attrs:
+                        if afn == 1:  # Paragraph style type
+                            run["para_style"] = aval
+                        elif afn == 5:  # Underline
+                            run["is_underline"] = bool(aval)
+                        elif afn == 6:  # Strikethrough
+                            run["is_strikethrough"] = bool(aval)
+                        elif afn == 8:  # Blockquote flag
+                            run["is_blockquote"] = bool(aval)
+                elif sfn == 5:  # Text style (bold/italic)
+                    run["text_style"] = sval
+                elif sfn == 8:  # Superscript (at style run level, not inside a2)
+                    run["is_superscript"] = bool(sval)
+                elif sfn == 9:  # Link URL
+                    if isinstance(sval, bytes):
+                        try:
+                            run["link_url"] = sval.decode("utf-8")
+                        except UnicodeDecodeError:
+                            pass
+
+            length = run["length"]
+            if length > 0 and pos < len(text):
+                run_text = text[pos : pos + length]
+                style_runs.append(
+                    StyleRun(
+                        start=pos,
+                        length=length,
+                        text=run_text,
+                        paragraph_style=run["para_style"],
+                        text_style=run["text_style"],
+                        is_blockquote=run["is_blockquote"],
+                        is_superscript=run["is_superscript"],
+                        is_underline=run["is_underline"],
+                        is_strikethrough=run["is_strikethrough"],
+                        link_url=run["link_url"],
+                    )
+                )
+                pos += length
+
+    return style_runs
+
+
+def parse_note_content(compressed_data: bytes) -> ParsedNote:
+    """Parse the gzip-compressed protobuf note content."""
+    try:
+        data = gzip.decompress(compressed_data)
+    except gzip.BadGzipFile:
+        return ParsedNote(
+            title="",
+            text_content="",
+            style_runs=[],
+            note_links=[],
+            raw_data=compressed_data,
+        )
+
+    # Extract main text content using proper protobuf structure
+    text_content = extract_main_text(data)
+
+    # Split into title (first line) and body
+    lines = text_content.split("\n", 1)
+    title = lines[0] if lines else ""
+    body = lines[1] if len(lines) > 1 else ""
+
+    # Extract style runs with formatting info
+    style_runs = extract_style_runs(data, text_content)
+
+    # Find note links from style runs (more accurate than string search)
+    note_links = []
+    for run in style_runs:
+        if run.link_url and run.link_url.startswith("applenotes:note/"):
+            parts = run.link_url.split("?")[0].split("/")
+            if len(parts) >= 2:
+                note_id = parts[-1]
+                note_links.append(
+                    NoteLink(url=run.link_url, note_id=note_id, text=run.text)
+                )
+
+    return ParsedNote(
+        title=title,
+        text_content=body,
+        style_runs=style_runs,
+        note_links=note_links,
+        raw_data=data,
+    )
+
+
+def get_folder_id(conn: sqlite3.Connection, folder_name: str) -> Optional[int]:
+    """Find the folder ID (Z_PK) for a folder by name."""
+    cursor = conn.cursor()
+    # Folders have ZTITLE2 set to the folder name
+    cursor.execute(
+        "SELECT Z_PK FROM ZICCLOUDSYNCINGOBJECT WHERE ZTITLE2 = ?", (folder_name,)
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def get_notes_from_folder(conn: sqlite3.Connection, folder_id: int) -> list:
+    """Fetch all notes from a folder by folder ID."""
+    cursor = conn.cursor()
+
+    # Query notes and join with note data
+    cursor.execute(
+        """
+        SELECT
+            n.Z_PK,
+            n.ZIDENTIFIER,
+            n.ZTITLE1,
+            n.ZSNIPPET,
+            n.ZCREATIONDATE3,
+            n.ZMODIFICATIONDATE1,
+            n.ZNOTEDATA,
+            nd.ZDATA
+        FROM ZICCLOUDSYNCINGOBJECT n
+        LEFT JOIN ZICNOTEDATA nd ON nd.Z_PK = n.ZNOTEDATA
+        WHERE n.ZFOLDER = ?
+        ORDER BY n.ZMODIFICATIONDATE1 DESC
+    """,
+        (folder_id,),
+    )
+
+    notes = []
+    for row in cursor.fetchall():
+        z_pk, identifier, title, snippet, creation_ts, mod_ts, notedata_pk, raw_data = (
+            row
+        )
+
+        # Parse timestamps
+        creation_date = apple_timestamp_to_datetime(creation_ts)
+        modification_date = apple_timestamp_to_datetime(mod_ts)
+
+        # Parse note content if available
+        parsed = None
+        if raw_data:
+            parsed = parse_note_content(raw_data)
+
+        notes.append(
+            {
+                "id": z_pk,
+                "identifier": identifier,
+                "title": title or (parsed.title if parsed else ""),
+                "snippet": snippet,
+                "creation_date": creation_date,
+                "modification_date": modification_date,
+                "parsed_content": parsed,
+            }
+        )
+
+    return notes
+
+
+def print_note_summary(note: dict, show_formatting: bool = False):
+    """Print a summary of a note."""
+    print(f"\n{'=' * 60}")
+    print(f"Title: {note['title']}")
+    print(f"ID: {note['identifier']}")
+    print(f"Created: {note['creation_date']}")
+    print(f"Modified: {note['modification_date']}")
+    print(f"-" * 60)
+
+    if note["parsed_content"]:
+        parsed = note["parsed_content"]
+        print(f"Text Content Preview:")
+        # Show first 500 chars
+        preview = parsed.text_content[:500]
+        if len(parsed.text_content) > 500:
+            preview += "..."
+        print(preview)
+
+        if parsed.note_links:
+            print(f"\nInternal Links:")
+            for link in parsed.note_links:
+                print(f"  - [{link.text}] -> {link.note_id}")
+
+        if show_formatting and parsed.style_runs:
+            print(f"\nFormatting Runs:")
+            for run in parsed.style_runs:
+                attrs = []
+                if run.paragraph_style != PARA_STYLE_NORMAL:
+                    attrs.append(run.style_name)
+                if run.is_blockquote:
+                    attrs.append("blockquote")
+                if run.is_bold:
+                    attrs.append("bold")
+                if run.is_italic:
+                    attrs.append("italic")
+                if run.is_superscript:
+                    attrs.append("superscript")
+                if run.is_underline:
+                    attrs.append("underline")
+                if run.is_strikethrough:
+                    attrs.append("strikethrough")
+                if run.link_url:
+                    url = (
+                        run.link_url[:40] + "..."
+                        if len(run.link_url) > 40
+                        else run.link_url
+                    )
+                    attrs.append(f"link:{url}")
+
+                if attrs:
+                    text_preview = run.text[:30].replace("\n", "\\n")
+                    print(
+                        f"  [{run.start}:{run.start + run.length}] {', '.join(attrs)}"
+                    )
+                    print(f'    "{text_preview}"')
+    else:
+        print(f"Snippet: {note['snippet']}")
+
+
+def export_notes_json(notes: list, output_path: str, include_formatting: bool = False):
+    """Export notes to JSON file."""
+    output = []
+    for note in notes:
+        entry = {
+            "id": note["id"],
+            "identifier": note["identifier"],
+            "title": note["title"],
+            "snippet": note["snippet"],
+            "creation_date": note["creation_date"].isoformat()
+            if note["creation_date"]
+            else None,
+            "modification_date": note["modification_date"].isoformat()
+            if note["modification_date"]
+            else None,
+        }
+        if note["parsed_content"]:
+            parsed = note["parsed_content"]
+            entry["text_content"] = parsed.text_content
+            entry["note_links"] = [
+                {"url": link.url, "note_id": link.note_id, "text": link.text}
+                for link in parsed.note_links
+            ]
+
+            if include_formatting:
+                entry["style_runs"] = [
+                    {
+                        "start": run.start,
+                        "length": run.length,
+                        "text": run.text,
+                        "style": run.style_name,
+                        "is_blockquote": run.is_blockquote,
+                        "is_bold": run.is_bold,
+                        "is_italic": run.is_italic,
+                        "is_superscript": run.is_superscript,
+                        "is_underline": run.is_underline,
+                        "is_strikethrough": run.is_strikethrough,
+                        "link_url": run.link_url,
+                    }
+                    for run in parsed.style_runs
+                    if (
+                        run.paragraph_style != PARA_STYLE_NORMAL
+                        or run.is_blockquote
+                        or run.text_style
+                        or run.is_superscript
+                        or run.is_underline
+                        or run.is_strikethrough
+                        or run.link_url
+                    )
+                ]
+        output.append(entry)
+
+    with open(output_path, "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"Exported {len(notes)} notes to {output_path}")
+
 
 def main():
-    """Main entry point."""
-    # Parse arguments
     parser = argparse.ArgumentParser(
-        description='Export notes from Notes.app to static HTML blog'
+        description="Query Apple Notes SQLite database directly"
     )
-    parser.add_argument('--config', help='Path to config.json file')
-    parser.add_argument('--folder', help='Notes folder name')
-    parser.add_argument('--templates', help='Template directory path')
-    parser.add_argument('--output', help='Output directory path')
-    parser.add_argument('--site-url', help='Site URL for RSS feed')
-    parser.add_argument('--site-title', help='Site title for RSS feed')
-    parser.add_argument('--site-description', help='Site description for RSS feed')
-    
+    parser.add_argument("--config", help="Path to config.json file")
+    parser.add_argument("--folder", help="Notes folder name (overrides config)")
+    parser.add_argument("--output", "-o", help="Output JSON file path")
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Print detailed note content"
+    )
+    parser.add_argument(
+        "--formatting",
+        "-f",
+        action="store_true",
+        help="Include formatting/style information in output",
+    )
+
     args = parser.parse_args()
-    
-    # Check dependencies
-    check_dependencies()
-    
+
     # Load configuration
-    config = load_config(args.config, args)
-    
-    folder_name = config['notesFolderName']
-    template_dir = config['templateDirectory']
-    output_dir = config['outputDirectory']
-    site_title = config['siteTitle']
-    site_url = config['siteUrl']
-    site_description = config['siteDescription']
-    
-    # Ensure output directory exists
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
-    # Load templates
-    article_template = load_template(template_dir, 'article')
-    snippet_template = load_template(template_dir, 'article-snippet')
-    index_template = load_template(template_dir, 'index')
-    feed_template = load_template(template_dir, 'feed')
-    
-    # Get notes from Notes.app
-    notes = get_notes_from_folder(folder_name)
-    
-    if not notes:
-        print(f"Error: Notes folder '{folder_name}' not found or empty", file=sys.stderr)
-        sys.exit(1)
-    
-    # Build note lookup for link resolution
-    note_lookup = build_note_lookup(notes)
-    
-    # Process each note
-    posts = []
-    
-    for note in notes:
-        title = note['name']
-        creation_date = note['creationDate']
-        slug = generate_slug(title, creation_date)
-        datetime_str = format_datetime(creation_date)
-        human_date = format_date(creation_date)
-        
-        # Transform content
-        html = note['body']
-        html = clean_html(html)
-        
-        # Remove first H1 (it's the title, already in header)
-        html = re.sub(r'^<h1>[^<]*</h1>\n*', '', html)
-        
-        html = resolve_links(html, note_lookup)
-        
-        footnote_result = process_footnotes(html, slug)
-        html = footnote_result['content']
-        
-        html = wrap_paragraphs(html)
-        
-        # Apply templates
-        template_vars = {
-            'title': title,
-            'slug': slug,
-            'datetime': datetime_str,
-            'humanDate': human_date,
-            'content': html,
-            'footer': footnote_result['footer']
-        }
-        
-        article_output = render_template(article_template, template_vars)
-        snippet_output = render_template(snippet_template, template_vars)
-        
-        # Write article file
-        write_article(slug, article_output, output_dir)
-        
-        # Store post data for index and RSS
-        posts.append({
-            'title': title,
-            'slug': slug,
-            'creationDate': creation_date,
-            'humanDate': human_date,
-            'content': html,
-            'articleSnippet': snippet_output
-        })
-    
-    # Generate index page
-    posts_sorted = sorted(posts, key=lambda p: p['creationDate'], reverse=True)[:30]
-    articles_html = '\n'.join([p['articleSnippet'] for p in posts_sorted])
-    index_html = render_template(index_template, {'articles': articles_html})
-    write_index(index_html, output_dir)
-    
-    # Generate RSS feed
-    rss_items = generate_rss_items(posts, site_url)
-    feed_vars = {
-        'site_title': site_title,
-        'site_url': site_url,
-        'site_description': site_description,
-        'items': rss_items
-    }
-    feed_xml = render_template(feed_template, feed_vars)
-    write_feed(feed_xml, output_dir)
-    
-    # Success message
-    print(f"Exported {len(posts)} posts")
+    config = load_config(args.config)
+    folder_name = args.folder or config["notesFolderName"]
+
+    # Check database exists
+    if not os.path.exists(NOTES_DB_PATH):
+        print(f"Error: Notes database not found at {NOTES_DB_PATH}")
+        return 1
+
+    # Connect to database (read-only)
+    conn = sqlite3.connect(f"file:{NOTES_DB_PATH}?mode=ro", uri=True)
+
+    try:
+        # Find folder
+        folder_id = get_folder_id(conn, folder_name)
+        if folder_id is None:
+            print(f"Error: Folder '{folder_name}' not found")
+            return 1
+
+        print(f"Found folder '{folder_name}' (ID: {folder_id})")
+
+        # Get notes
+        notes = get_notes_from_folder(conn, folder_id)
+        print(f"Found {len(notes)} notes")
+
+        # Output
+        if args.output:
+            export_notes_json(notes, args.output, include_formatting=args.formatting)
+        elif args.verbose:
+            for note in notes:
+                print_note_summary(note, show_formatting=args.formatting)
+        else:
+            # Brief listing
+            for note in notes:
+                date_str = (
+                    note["modification_date"].strftime("%Y-%m-%d")
+                    if note["modification_date"]
+                    else "Unknown"
+                )
+                print(f"  [{date_str}] {note['title']}")
+                if note["parsed_content"] and note["parsed_content"].note_links:
+                    for link in note["parsed_content"].note_links:
+                        print(f"             -> links to: {link.note_id}")
+
+    finally:
+        conn.close()
+
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    exit(main())

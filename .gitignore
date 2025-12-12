@@ -8,5 +8,4 @@
 .DS_Store
 
 # Notes database copy
-_ignore/
-_ai/
+site/
