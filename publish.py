@@ -616,17 +616,29 @@ def write_file(filepath, content, output_dir=None):
 # --- RSS Generation ---
 
 
+def escape_xml(text):
+    """
+    Escape XML special characters for use in XML elements.
+    
+    Uses html.escape which handles &, <, >, ", and '.
+    """
+    import html
+    return html.escape(text, quote=True)
+
+
 def generate_rss_items(posts, site_url):
     """Generate RSS item elements for posts."""
     items = []
     recent_posts = sorted(posts, key=lambda p: p["creationDate"], reverse=True)[:30]
 
     for post in recent_posts:
-        title = post["title"]
-        link = f"{site_url}/{post['slug']}.html"
+        # Escape title and link for XML safety
+        title = escape_xml(post["title"])
+        link = escape_xml(f"{site_url}/{post['slug']}.html")
         pub_date = format_rfc822_date(post["creationDate"])
         content = post["content"]
 
+        # Content is wrapped in CDATA, but we still need to escape CDATA end markers
         content = content.replace("]]>", "]]]]><![CDATA[>")
 
         item = f"""<item>
