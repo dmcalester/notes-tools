@@ -7,5 +7,9 @@
 # macOS-specific files
 .DS_Store
 
+# AI
+PLAN.md
+
 # Notes database copy
 site/
+manifest.json

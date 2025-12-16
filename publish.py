@@ -18,6 +18,20 @@ from pathlib import Path
 import export
 
 
+def find_config_dir(config_path=None):
+    """Find the directory containing config.json."""
+    if config_path:
+        return Path(config_path).parent
+
+    script_dir = Path(__file__).parent
+    if (script_dir / "config.json").exists():
+        return script_dir
+    elif Path("config.json").exists():
+        return Path.cwd()
+    else:
+        return None
+
+
 def load_config(config_path=None, cli_args=None):
     """Load configuration from file and merge with CLI arguments."""
     config = {
@@ -60,6 +74,38 @@ def load_config(config_path=None, cli_args=None):
             config["siteDescription"] = cli_args.site_description
 
     return config
+
+
+def load_manifest(config_path=None):
+    """Load the publish manifest from the config directory."""
+    config_dir = find_config_dir(config_path)
+    if config_dir is None:
+        return None
+
+    manifest_path = config_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+
+    with open(manifest_path, "r") as f:
+        return json.load(f)
+
+
+def save_manifest(config_path=None):
+    """Save the publish manifest with current timestamp (UTC)."""
+    from datetime import timezone
+
+    config_dir = find_config_dir(config_path)
+    if config_dir is None:
+        # Fall back to current directory
+        config_dir = Path.cwd()
+
+    manifest_path = config_dir / "manifest.json"
+    manifest = {"last_published": datetime.now(timezone.utc).isoformat()}
+
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    return manifest_path
 
 
 # --- Helper Functions ---
@@ -242,12 +288,10 @@ def get_block_type(run):
     """Determine the block type for a style run."""
     if run.is_blockquote:
         return "blockquote"
-    elif run.paragraph_style == export.PARA_STYLE_TITLE:
-        return "h1"
     elif run.paragraph_style == export.PARA_STYLE_HEADING:
-        return "h2"
+        return "h1"
     elif run.paragraph_style == export.PARA_STYLE_SUBHEADING:
-        return "h3"
+        return "h2"
     elif run.paragraph_style == export.PARA_STYLE_MONO:
         return "code"
     elif run.paragraph_style == export.PARA_STYLE_BULLET_LIST:
@@ -578,6 +622,12 @@ def main():
     site_url = config["siteUrl"]
     site_description = config["siteDescription"]
 
+    # Load manifest for incremental publishing
+    manifest = load_manifest(args.config)
+    last_published = None
+    if manifest and "last_published" in manifest:
+        last_published = datetime.fromisoformat(manifest["last_published"])
+
     # Ensure output directory exists
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -606,17 +656,30 @@ def main():
             print(f"Error: Folder '{folder_name}' not found", file=sys.stderr)
             sys.exit(1)
 
-        notes = export.get_notes_from_folder(conn, folder_id)
+        all_notes = export.get_notes_from_folder(conn, folder_id)
     finally:
         conn.close()
 
-    if not notes:
+    if not all_notes:
         print(f"Error: No notes found in folder '{folder_name}'", file=sys.stderr)
         sys.exit(1)
 
-    # Build note lookup for link resolution
+    # Filter notes by modification date if manifest exists
+    if last_published:
+        notes = [
+            note
+            for note in all_notes
+            if note["modification_date"] and note["modification_date"] > last_published
+        ]
+        if not notes:
+            print(f"No notes modified since {last_published.isoformat()}")
+            sys.exit(0)
+    else:
+        notes = all_notes
+
+    # Build note lookup for link resolution (use all_notes so links resolve even in incremental mode)
     note_lookup = {}
-    for note in notes:
+    for note in all_notes:
         title = note["title"]
         creation_date = note["creation_date"]
         slug = generate_slug(title, creation_date)
@@ -690,7 +753,14 @@ def main():
     feed_xml = render_template(feed_template, feed_vars)
     write_file(f"{output_dir}/feed.xml", feed_xml)
 
-    print(f"Published {len(posts)} posts to {output_dir}")
+    # Save manifest with current timestamp
+    manifest_path = save_manifest(args.config)
+
+    if last_published:
+        print(f"Published {len(posts)} updated posts to {output_dir}")
+    else:
+        print(f"Published {len(posts)} posts to {output_dir}")
+    print(f"Manifest saved to {manifest_path}")
 
 
 if __name__ == "__main__":

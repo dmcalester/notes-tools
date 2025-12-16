@@ -64,10 +64,9 @@ def apple_timestamp_to_datetime(timestamp: float) -> datetime:
 
 # Paragraph style types (from protobuf attribute a1)
 PARA_STYLE_NORMAL = 0
-PARA_STYLE_TITLE = 1  # H1
-PARA_STYLE_HEADING = 2  # H2
-PARA_STYLE_SUBHEADING = 4  # H3 / Monospaced in some contexts
-PARA_STYLE_MONO = 5  # Monospaced/code
+PARA_STYLE_HEADING = 1  # "Heading" in Notes UI - maps to H1
+PARA_STYLE_SUBHEADING = 2  # "Subheading" in Notes UI - maps to H2
+PARA_STYLE_MONO = 4  # "Monospaced" in Notes UI - maps to <code>
 PARA_STYLE_BULLET_LIST = 100  # Bulleted list (•)
 PARA_STYLE_DASH_LIST = 101  # Dashed list (-)
 PARA_STYLE_NUMBER_LIST = 102  # Numbered list (1. 2. 3.)
@@ -106,7 +105,6 @@ class StyleRun:
     def style_name(self) -> str:
         """Human-readable paragraph style name."""
         names = {
-            PARA_STYLE_TITLE: "title",
             PARA_STYLE_HEADING: "heading",
             PARA_STYLE_SUBHEADING: "subheading",
             PARA_STYLE_MONO: "monospace",
