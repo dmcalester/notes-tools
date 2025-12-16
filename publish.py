@@ -147,7 +147,12 @@ def validate_config(config):
 
 
 def load_manifest(config_path=None):
-    """Load the publish manifest from the config directory."""
+    """
+    Load the publish manifest from the config directory.
+    
+    Includes validation and automatic recovery from corruption.
+    Returns None if manifest doesn't exist or is corrupted beyond repair.
+    """
     config_dir = find_config_dir(config_path)
     if config_dir is None:
         return None
@@ -156,8 +161,44 @@ def load_manifest(config_path=None):
     if not manifest_path.exists():
         return None
 
-    with open(manifest_path, "r") as f:
-        return json.load(f)
+    try:
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+        
+        # Validate structure
+        if not isinstance(manifest, dict):
+            raise ValueError("Manifest must be a dict")
+        
+        # Validate required fields
+        if "notes" not in manifest:
+            raise ValueError("Manifest missing 'notes' field")
+        if not isinstance(manifest["notes"], dict):
+            raise ValueError("Manifest 'notes' field must be a dict")
+        
+        # Validate optional fields have correct types
+        if "last_published" in manifest and not isinstance(manifest["last_published"], str):
+            raise ValueError("Manifest 'last_published' must be a string")
+        if "snippets" in manifest and not isinstance(manifest["snippets"], dict):
+            raise ValueError("Manifest 'snippets' must be a dict")
+        
+        return manifest
+    
+    except (json.JSONDecodeError, ValueError) as e:
+        print(
+            f"Warning: Corrupted manifest ({e}), forcing full rebuild",
+            file=sys.stderr
+        )
+        
+        # Backup corrupted manifest
+        backup_path = manifest_path.with_suffix('.json.backup')
+        try:
+            manifest_path.rename(backup_path)
+            print(f"Corrupted manifest backed up to: {backup_path}", file=sys.stderr)
+        except Exception as backup_error:
+            print(f"Could not backup manifest: {backup_error}", file=sys.stderr)
+        
+        # Return None to trigger full rebuild
+        return None
 
 
 def save_manifest(config_path=None, notes_paths=None, snippets_cache=None):
