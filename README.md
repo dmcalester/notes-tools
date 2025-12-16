@@ -3,31 +3,33 @@
 A spiritual successor to Markdown - write in Notes.app with minimal markup, export to clean HTML.
 
 Export notes from Apple Notes to static HTML blog posts with support for:
-- Wiki-style `[[links]]` between notes
-- Footnotes with `[^1]` syntax
-- Automatic paragraph wrapping
+- Direct SQLite database access (no AppleScript/osascript)
+- Rich text formatting (bold, italic, links, lists, headings, code blocks)
+- Internal note links (converted to HTML links)
+- Nested folders with hierarchical URLs
 - RSS feed generation
-- Date-based URL slugs (`YYYY/MM/title-slug`)
+- Incremental publishing (only regenerates modified notes)
+- Automatic redirects for moved notes
 
 ## Requirements
 
-- macOS (uses Notes.app via osascript)
-- Python 3 (built-in on macOS)
+- macOS (accesses Notes.app SQLite database)
+- Python 3.6+ (built-in on modern macOS)
 
 ## Quick Start
 
 ```bash
-# Basic usage (uses config.json in current/script directory)
-./export.py
+# Publish notes to static HTML
+python3 publish.py
 
 # Specify different folder
-./export.py --folder "Blog Posts"
+python3 publish.py --folder "Blog Posts"
 
-# Override output location
-./export.py --output ./public
+# Force publish even if notes moved (generates redirects)
+python3 publish.py --force
 
-# Override all settings
-./export.py --folder "Posts" --output ./dist --site-url https://myblog.com
+# Export notes to JSON (for inspection/debugging)
+python3 export.py --folder "test" --verbose
 ```
 
 ## Configuration
@@ -52,17 +54,40 @@ Config file is searched in:
 
 CLI flags override config file settings.
 
-## CLI Options
+## Commands
 
+### publish.py - Generate Static Site
+
+Main command to publish notes as HTML:
+
+```bash
+python3 publish.py [options]
 ```
---config CONFIG               Path to config.json file
---folder FOLDER              Notes folder name
---templates TEMPLATES        Template directory path
---output OUTPUT              Output directory path
---site-url SITE_URL          Site URL for RSS feed
---site-title SITE_TITLE      Site title for RSS feed
---site-description DESC      Site description for RSS feed
+
+**Options:**
+- `--config CONFIG` - Path to config.json file
+- `--folder FOLDER` - Notes folder name (overrides config)
+- `--templates TEMPLATES` - Template directory path
+- `--output OUTPUT` - Output directory path
+- `--site-url SITE_URL` - Site URL for RSS feed
+- `--site-title SITE_TITLE` - Site title for RSS feed
+- `--site-description SITE_DESCRIPTION` - Site description
+- `--force` - Force publish even if notes moved (generates redirects)
+
+### export.py - Export to JSON
+
+Export notes metadata and content to JSON:
+
+```bash
+python3 export.py [options]
 ```
+
+**Options:**
+- `--config CONFIG` - Path to config.json file
+- `--folder FOLDER` - Notes folder name (overrides config)
+- `--output OUTPUT` - Output JSON file path
+- `--verbose` - Print detailed note content
+- `--formatting` - Include formatting/style information
 
 ## Templates
 
@@ -88,45 +113,99 @@ RSS 2.0 feed template.
 
 Variables: `{{site_title}}`, `{{site_url}}`, `{{site_description}}`, `{{items}}`
 
-## Markup Conventions
+## Features
 
-### Wiki-Style Links
+### Rich Text Support
+
+Notes.app formatting is preserved:
+- **Bold** and *italic* text
+- Headings (H1, H2)
+- Bulleted and numbered lists
+- Monospace/code blocks
+- Blockquotes
+- Links (internal and external)
+- Strikethrough and underline
+- Superscript (for footnotes)
+
+### Internal Note Links
+
+Links between notes in Notes.app are automatically converted to HTML links:
 ```
-Link to another note: [[Note Title]]
+[[Other Note Title]]
 ```
-Becomes: `<a href="/YYYY/MM/note-title.html">Note Title</a>`
+Becomes: `<a href="/folder/other-note-title.html">Other Note Title</a>`
+
+### Nested Folders
+
+Notes in subfolders get hierarchical URLs:
+```
+Blog/
+  Tech/
+    My Note.md  →  /tech/my-note.html
+  Personal/
+    Thoughts.md →  /personal/thoughts.html
+```
+
+### Incremental Publishing
+
+Only modified notes are regenerated on subsequent runs:
+- Manifest tracks last publish time and note paths
+- Cached snippets for unchanged notes (fast index/RSS generation)
+- Automatic redirect generation for moved notes
 
 ### Footnotes
-```
-Here's a statement[^1]
 
-[^1]: This is the footnote text
-```
-
-Generates anchored footnotes with return links.
+Superscript numbers in Notes.app are converted to proper HTML footnotes with return links.
 
 ## Output Structure
 
 ```
 output/
-├── index.html              # 30 most recent posts
-├── feed.xml                # RSS feed
-└── YYYY/
-    └── MM/
-        └── title-slug.html # Individual posts
+├── index.html                      # 30 most recent posts
+├── feed.xml                        # RSS feed (30 most recent)
+├── .htaccess                       # Redirects for moved notes
+├── article-name.html               # Top-level articles
+└── folder-name/
+    └── nested-article.html         # Nested folder articles
 ```
 
-## Notes to SQLite Migration
+## How It Works
 
-To switch from AppleScript to direct SQLite access (future):
-
-1. Replace the `get_notes_from_folder()` function in export.py
-2. Return same structure: `[{name, body, creationDate}, ...]`
-3. Everything else stays the same
+1. **Read Notes Database**: Directly queries Notes.app SQLite database (`~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite`)
+2. **Parse Protobuf**: Extracts note content and formatting from gzip-compressed protobuf data
+3. **Generate HTML**: Converts rich text formatting to semantic HTML
+4. **Build Site**: Creates article pages, index, and RSS feed from templates
+5. **Save Manifest**: Tracks published notes and cached snippets for incremental builds
 
 ## Performance
 
-**Python version**: Sub-second for dozens of notes
-**Old JXA version**: 5-10+ seconds (and sometimes hangs)
+- **Full rebuild**: ~100ms for 6 notes
+- **Incremental**: ~50ms (2x faster, scales to 10-100x with more notes)
+- **Direct SQLite access**: No AppleScript overhead
+- **Cached snippets**: Avoids regenerating unchanged notes
 
-The Notes.app bridge via osascript is the bottleneck, but Python's text processing is significantly faster than JXA.
+## Security & Validation
+
+The codebase includes comprehensive security measures:
+- Path traversal protection (prevents writing outside output directory)
+- XML escaping for RSS feeds
+- Config validation (blocks dangerous output paths)
+- Database schema validation (detects incompatible Notes versions)
+- Manifest corruption recovery (automatic backup and rebuild)
+
+## Troubleshooting
+
+### "Notes database not found"
+The database path is: `~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite`
+
+If Notes.app is running, this should exist. If not, check your Notes.app installation.
+
+### "Database schema incompatible"
+Your Notes.app version may have changed the database structure. Please report this issue with your macOS and Notes.app versions.
+
+### "Folder not found"
+The script lists available folders in the error message. Folder names are case-sensitive.
+
+### Permission errors
+You may need to grant Full Disk Access to Terminal or Python in:
+System Preferences → Privacy & Security → Full Disk Access
