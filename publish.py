@@ -580,9 +580,33 @@ def render_template(template, variables):
 # --- File Writing ---
 
 
-def write_file(filepath, content):
-    """Write content to file, creating directories as needed."""
-    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+def write_file(filepath, content, output_dir=None):
+    """
+    Write content to file, creating directories as needed.
+    
+    Args:
+        filepath: Path to write to
+        content: Content to write
+        output_dir: Optional output directory to validate against (prevents path traversal)
+    
+    Raises:
+        ValueError: If filepath attempts to write outside output_dir
+    """
+    filepath = Path(filepath).resolve()
+    
+    # Validate path is within output directory (prevent path traversal)
+    if output_dir:
+        output_dir = Path(output_dir).resolve()
+        try:
+            filepath.relative_to(output_dir)
+        except ValueError:
+            raise ValueError(
+                f"Security error: Attempted to write outside output directory\n"
+                f"  Target: {filepath}\n"
+                f"  Allowed: {output_dir}"
+            )
+    
+    filepath.parent.mkdir(parents=True, exist_ok=True)
     with open(filepath, "w") as f:
         f.write(content)
 
@@ -860,7 +884,7 @@ def main():
         snippet_output = render_template(snippet_template, template_vars)
 
         # Write article file
-        write_file(f"{output_dir}/{slug}.html", article_output)
+        write_file(f"{output_dir}/{slug}.html", article_output, output_dir)
         updated_count += 1
 
         # Store post data for this note
@@ -928,7 +952,7 @@ def main():
     posts_sorted = sorted(posts, key=lambda p: p["creationDate"], reverse=True)[:30]
     articles_html = "\n".join([p["articleSnippet"] for p in posts_sorted])
     index_html = render_template(index_template, {"articles": articles_html})
-    write_file(f"{output_dir}/index.html", index_html)
+    write_file(f"{output_dir}/index.html", index_html, output_dir)
 
     # Generate RSS feed (with all posts, not just updated ones)
     rss_items = generate_rss_items(posts, site_url)
@@ -939,7 +963,7 @@ def main():
         "items": rss_items,
     }
     feed_xml = render_template(feed_template, feed_vars)
-    write_file(f"{output_dir}/feed.xml", feed_xml)
+    write_file(f"{output_dir}/feed.xml", feed_xml, output_dir)
 
     # Build notes_paths for manifest (all notes, not just published ones)
     notes_paths = {}
