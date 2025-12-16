@@ -90,13 +90,14 @@ def load_manifest(config_path=None):
         return json.load(f)
 
 
-def save_manifest(config_path=None, notes_paths=None):
+def save_manifest(config_path=None, notes_paths=None, snippets_cache=None):
     """
-    Save the publish manifest with current timestamp and note paths.
+    Save the publish manifest with current timestamp, note paths, and snippet cache.
 
     Args:
         config_path: Path to config file (to find manifest location)
         notes_paths: Dict of {identifier: path} for all published notes
+        snippets_cache: Dict of {identifier: {snippet, metadata}} for cached snippets
     """
     from datetime import timezone
 
@@ -109,6 +110,7 @@ def save_manifest(config_path=None, notes_paths=None):
     manifest = {
         "last_published": datetime.now(timezone.utc).isoformat(),
         "notes": notes_paths or {},
+        "snippets": snippets_cache or {},
     }
 
     with open(manifest_path, "w") as f:
@@ -899,54 +901,67 @@ def main():
             }
         )
 
-    # For incremental builds, we need to generate snippets for all notes (not just updated ones)
-    # so that index.html and feed.xml contain all published articles
+    # For incremental builds, use cached snippets for unchanged notes
+    # This avoids expensive HTML regeneration for every note
     if last_published and updated_count > 0:
-        # Build snippets for all OTHER notes (ones we didn't just process)
+        # Get cached snippets from manifest
+        cached_snippets = manifest.get("snippets", {}) if manifest else {}
         processed_identifiers = {note["identifier"] for note in notes}
+        
         for note in all_notes:
             if note["identifier"] in processed_identifiers:
                 continue  # Already processed above
-
+            
+            identifier = note["identifier"]
             title = note["title"]
             creation_date = note["creation_date"]
             folder_path = note.get("folder_path", [])
             slug = generate_slug(title, folder_path)
-            datetime_str = format_datetime(creation_date)
-            human_date = format_date(creation_date)
-
-            parsed = note["parsed_content"]
-
-            # Convert to HTML using style runs
-            html = convert_note_to_html(parsed, note_lookup, slug)
-
-            # Process footnotes
-            footnote_result = process_footnotes(html, slug)
-            html = footnote_result["content"]
-
-            # Apply templates (only need snippet for index/RSS)
-            template_vars = {
-                "title": title,
-                "slug": slug,
-                "datetime": datetime_str,
-                "humanDate": human_date,
-                "content": html,
-                "footer": footnote_result["footer"],
-            }
-
-            snippet_output = render_template(snippet_template, template_vars)
-
-            # Store post data
-            posts.append(
-                {
+            
+            # Try to use cached snippet if available
+            if identifier in cached_snippets:
+                cached = cached_snippets[identifier]
+                posts.append(
+                    {
+                        "title": cached["title"],
+                        "slug": cached["slug"],
+                        "creationDate": creation_date,
+                        "humanDate": cached["humanDate"],
+                        "content": cached["content"],
+                        "articleSnippet": cached["snippet"],
+                    }
+                )
+            else:
+                # Cache miss - need to generate (shouldn't happen often)
+                datetime_str = format_datetime(creation_date)
+                human_date = format_date(creation_date)
+                parsed = note["parsed_content"]
+                
+                html = convert_note_to_html(parsed, note_lookup, slug)
+                footnote_result = process_footnotes(html, slug)
+                html = footnote_result["content"]
+                
+                template_vars = {
                     "title": title,
                     "slug": slug,
-                    "creationDate": creation_date,
+                    "datetime": datetime_str,
                     "humanDate": human_date,
                     "content": html,
-                    "articleSnippet": snippet_output,
+                    "footer": footnote_result["footer"],
                 }
-            )
+                
+                snippet_output = render_template(snippet_template, template_vars)
+                
+                posts.append(
+                    {
+                        "title": title,
+                        "slug": slug,
+                        "creationDate": creation_date,
+                        "humanDate": human_date,
+                        "content": html,
+                        "articleSnippet": snippet_output,
+                    }
+                )
 
     # Generate index page (with all posts, not just updated ones)
     posts_sorted = sorted(posts, key=lambda p: p["creationDate"], reverse=True)[:30]
@@ -965,16 +980,39 @@ def main():
     feed_xml = render_template(feed_template, feed_vars)
     write_file(f"{output_dir}/feed.xml", feed_xml, output_dir)
 
-    # Build notes_paths for manifest (all notes, not just published ones)
+    # Build notes_paths and snippets cache for manifest
     notes_paths = {}
+    snippets_cache = {}
+    
+    # Create a lookup by identifier for posts we just generated
+    posts_by_id = {}
+    for note in all_notes:
+        identifier = note["identifier"]
+        # Find this note in posts array (if it was processed)
+        for post in posts:
+            if post["slug"] == generate_slug(note["title"], note.get("folder_path", [])):
+                posts_by_id[identifier] = post
+                break
+    
     for note in all_notes:
         identifier = note["identifier"]
         folder_path = note.get("folder_path", [])
         slug = generate_slug(note["title"], folder_path)
         notes_paths[identifier] = f"/{slug}"
+        
+        # Cache snippet data for this note
+        if identifier in posts_by_id:
+            post = posts_by_id[identifier]
+            snippets_cache[identifier] = {
+                "title": post["title"],
+                "slug": post["slug"],
+                "humanDate": post["humanDate"],
+                "content": post["content"],
+                "snippet": post["articleSnippet"],
+            }
 
-    # Save manifest with current timestamp and note paths
-    manifest_path = save_manifest(args.config, notes_paths)
+    # Save manifest with current timestamp, note paths, and snippet cache
+    manifest_path = save_manifest(args.config, notes_paths, snippets_cache)
 
     if last_published:
         print(f"Published {updated_count} updated posts to {output_dir}")
