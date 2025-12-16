@@ -415,6 +415,73 @@ def get_folder_id(conn: sqlite3.Connection, folder_name: str) -> Optional[int]:
     return row[0] if row else None
 
 
+def get_folder_name(conn: sqlite3.Connection, folder_id: int) -> Optional[str]:
+    """Get the name of a folder by its ID."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT ZTITLE2 FROM ZICCLOUDSYNCINGOBJECT WHERE Z_PK = ?", (folder_id,)
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def get_folder_parent(conn: sqlite3.Connection, folder_id: int) -> Optional[int]:
+    """Get the parent folder ID of a folder."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT ZPARENT FROM ZICCLOUDSYNCINGOBJECT WHERE Z_PK = ?", (folder_id,)
+    )
+    row = cursor.fetchone()
+    return row[0] if row and row[0] else None
+
+
+def get_folder_path(
+    conn: sqlite3.Connection, folder_id: int, root_folder_id: int
+) -> list[str]:
+    """
+    Get the folder path from root to the given folder.
+
+    Returns a list of folder names, excluding the root folder.
+    E.g., if root is "Blog" and folder is "Blog/Tech/Python", returns ["Tech", "Python"]
+    """
+    path = []
+    current_id = folder_id
+
+    while current_id and current_id != root_folder_id:
+        name = get_folder_name(conn, current_id)
+        if name:
+            path.append(name)
+        current_id = get_folder_parent(conn, current_id)
+
+    # Reverse to get root-to-leaf order
+    path.reverse()
+    return path
+
+
+def get_all_subfolders(conn: sqlite3.Connection, folder_id: int) -> list[int]:
+    """
+    Recursively get all subfolder IDs under a folder.
+
+    Returns a list of folder IDs (not including the root folder itself).
+    """
+    cursor = conn.cursor()
+    subfolders = []
+
+    # Get immediate children (ZPARENT is used for folder hierarchy, ZFOLDER is for notes)
+    cursor.execute(
+        "SELECT Z_PK FROM ZICCLOUDSYNCINGOBJECT WHERE ZPARENT = ? AND ZTITLE2 IS NOT NULL",
+        (folder_id,),
+    )
+
+    for row in cursor.fetchall():
+        child_id = row[0]
+        subfolders.append(child_id)
+        # Recurse into children
+        subfolders.extend(get_all_subfolders(conn, child_id))
+
+    return subfolders
+
+
 def get_notes_from_folder(conn: sqlite3.Connection, folder_id: int) -> list:
     """Fetch all notes from a folder by folder ID."""
     cursor = conn.cursor()
@@ -462,6 +529,87 @@ def get_notes_from_folder(conn: sqlite3.Connection, folder_id: int) -> list:
                 "snippet": snippet,
                 "creation_date": creation_date,
                 "modification_date": modification_date,
+                "parsed_content": parsed,
+            }
+        )
+
+    return notes
+
+
+def get_notes_from_folder_recursive(
+    conn: sqlite3.Connection, root_folder_id: int
+) -> list:
+    """
+    Fetch all notes from a folder and all its subfolders.
+
+    Each note includes a 'folder_path' field with the path relative to root.
+    E.g., a note in Blog/Tech/Python has folder_path=["Tech", "Python"]
+    """
+    cursor = conn.cursor()
+
+    # Get all folder IDs (root + subfolders)
+    all_folder_ids = [root_folder_id] + get_all_subfolders(conn, root_folder_id)
+
+    # Build placeholders for IN clause
+    placeholders = ",".join("?" * len(all_folder_ids))
+
+    # Query all notes from all folders at once
+    cursor.execute(
+        f"""
+        SELECT
+            n.Z_PK,
+            n.ZIDENTIFIER,
+            n.ZTITLE1,
+            n.ZSNIPPET,
+            n.ZCREATIONDATE3,
+            n.ZMODIFICATIONDATE1,
+            n.ZNOTEDATA,
+            n.ZFOLDER,
+            nd.ZDATA
+        FROM ZICCLOUDSYNCINGOBJECT n
+        LEFT JOIN ZICNOTEDATA nd ON nd.Z_PK = n.ZNOTEDATA
+        WHERE n.ZFOLDER IN ({placeholders})
+          AND n.ZTITLE1 IS NOT NULL
+        ORDER BY n.ZMODIFICATIONDATE1 DESC
+        """,
+        all_folder_ids,
+    )
+
+    notes = []
+    for row in cursor.fetchall():
+        (
+            z_pk,
+            identifier,
+            title,
+            snippet,
+            creation_ts,
+            mod_ts,
+            notedata_pk,
+            note_folder_id,
+            raw_data,
+        ) = row
+
+        # Parse timestamps
+        creation_date = apple_timestamp_to_datetime(creation_ts)
+        modification_date = apple_timestamp_to_datetime(mod_ts)
+
+        # Get folder path relative to root
+        folder_path = get_folder_path(conn, note_folder_id, root_folder_id)
+
+        # Parse note content if available
+        parsed = None
+        if raw_data:
+            parsed = parse_note_content(raw_data)
+
+        notes.append(
+            {
+                "id": z_pk,
+                "identifier": identifier,
+                "title": title or (parsed.title if parsed else ""),
+                "snippet": snippet,
+                "creation_date": creation_date,
+                "modification_date": modification_date,
+                "folder_path": folder_path,
                 "parsed_content": parsed,
             }
         )
