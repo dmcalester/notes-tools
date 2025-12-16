@@ -404,6 +404,63 @@ def parse_note_content(compressed_data: bytes) -> ParsedNote:
     )
 
 
+def check_database_schema(conn: sqlite3.Connection) -> None:
+    """
+    Verify the Notes database has the expected schema.
+    
+    Raises:
+        RuntimeError: If required columns are missing (incompatible Notes version)
+    """
+    cursor = conn.cursor()
+    
+    # Check for expected table
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='ZICCLOUDSYNCINGOBJECT'"
+    )
+    if not cursor.fetchone():
+        raise RuntimeError(
+            "Database schema incompatible: ZICCLOUDSYNCINGOBJECT table not found.\n"
+            "This may indicate an incompatible Notes.app version or corrupted database."
+        )
+    
+    # Check for expected columns
+    cursor.execute("PRAGMA table_info(ZICCLOUDSYNCINGOBJECT)")
+    columns = {row[1] for row in cursor.fetchall()}
+    
+    # Required columns for folder and note operations
+    required_columns = {
+        'Z_PK',         # Primary key
+        'ZTITLE1',      # Note title
+        'ZTITLE2',      # Folder title
+        'ZFOLDER',      # Note's parent folder
+        'ZPARENT',      # Folder's parent folder
+        'ZIDENTIFIER',  # Note/folder identifier
+        'ZCREATIONDATE3',     # Creation timestamp
+        'ZMODIFICATIONDATE1', # Modification timestamp
+        'ZNOTEDATA',    # Link to note content
+    }
+    
+    missing = required_columns - columns
+    
+    if missing:
+        raise RuntimeError(
+            f"Database schema incompatible. Missing columns: {missing}\n"
+            f"Found columns: {sorted(columns)}\n"
+            f"This may indicate an incompatible Notes.app version.\n"
+            f"Please report this issue with your macOS and Notes.app versions."
+        )
+    
+    # Check for note data table
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='ZICNOTEDATA'"
+    )
+    if not cursor.fetchone():
+        raise RuntimeError(
+            "Database schema incompatible: ZICNOTEDATA table not found.\n"
+            "This may indicate an incompatible Notes.app version."
+        )
+
+
 def get_folder_id(conn: sqlite3.Connection, folder_name: str) -> Optional[int]:
     """Find the folder ID (Z_PK) for a folder by name."""
     cursor = conn.cursor()
@@ -765,6 +822,13 @@ def main():
     conn = sqlite3.connect(f"file:{NOTES_DB_PATH}?mode=ro", uri=True)
 
     try:
+        # Validate database schema
+        try:
+            check_database_schema(conn)
+        except RuntimeError as e:
+            print(f"Error: {e}")
+            return 1
+        
         # Find folder
         folder_id = get_folder_id(conn, folder_name)
         if folder_id is None:

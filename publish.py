@@ -821,6 +821,13 @@ def main():
     conn = sqlite3.connect(f"file:{export.NOTES_DB_PATH}?mode=ro", uri=True)
 
     try:
+        # Validate database schema
+        try:
+            export.check_database_schema(conn)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        
         folder_id = export.get_folder_id(conn, folder_name)
         if folder_id is None:
             print(f"Error: Folder '{folder_name}' not found", file=sys.stderr)
