@@ -1,6 +1,6 @@
 {
    "notesFolderName": "test",
-   "templateDirectory": "./sample//templates",
+   "templateDirectory": "./sample/templates",
    "outputDirectory": "./sample/site",
    "siteTitle": "My Site",
    "siteUrl": "https://sample.com",

@@ -1,6 +1,6 @@
 # Notes Export
 
-A spiritual successor to Markdown - write in Notes.app with minimal markup, export to clean HTML.
+Inspired by recollection of Jon Gruber’s reasons for creating Markdown for [Daring Fireball](https://daringfireball.net/) - a simple way to focus on writing, and not structure. I love Apple’s Notes app, it’s focused and with just enough structure and formatting to keep my focused on content and not presentation or ogranization. I’ve always thought it would be a great minimal Content Management System for simple blog-like web sites.
 
 Export notes from Apple Notes to static HTML blog posts with support for:
 - Direct SQLite database access (no AppleScript/osascript)
