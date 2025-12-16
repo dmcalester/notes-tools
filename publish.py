@@ -76,6 +76,76 @@ def load_config(config_path=None, cli_args=None):
     return config
 
 
+def validate_config(config):
+    """
+    Validate configuration values for security and correctness.
+    
+    Args:
+        config: Configuration dictionary
+        
+    Raises:
+        ValueError: If configuration contains unsafe or invalid values
+    """
+    # Validate output directory is safe
+    output_dir = Path(config["outputDirectory"]).expanduser().resolve()
+    
+    # List of dangerous paths that should never be output directories
+    dangerous_paths = [
+        Path.home(),  # User home directory
+        Path("/"),  # Root
+        Path("/etc"),  # System config
+        Path("/usr"),  # System binaries
+        Path("/var"),  # System data
+        Path("/System"),  # macOS system (if exists)
+        Path("/Library"),  # macOS system library (if exists)
+    ]
+    
+    for dangerous in dangerous_paths:
+        if not dangerous.exists():
+            continue
+        dangerous_resolved = dangerous.resolve()
+        # Check if output_dir is the dangerous path or a parent of it
+        if output_dir == dangerous_resolved:
+            raise ValueError(
+                f"Unsafe output directory: {output_dir}\n"
+                f"Cannot write to {dangerous_resolved}"
+            )
+        # Check if dangerous path would be inside output (e.g., output="/")
+        try:
+            dangerous_resolved.relative_to(output_dir)
+            raise ValueError(
+                f"Unsafe output directory: {output_dir}\n"
+                f"This would allow writing to {dangerous_resolved}"
+            )
+        except ValueError:
+            # Not relative - this is good, continue checking
+            pass
+    
+    # Validate template directory exists
+    template_dir = Path(config["templateDirectory"])
+    if not template_dir.exists():
+        raise ValueError(
+            f"Template directory does not exist: {template_dir}\n"
+            f"Please create it or update templateDirectory in config"
+        )
+    
+    # Validate template directory is readable
+    if not template_dir.is_dir():
+        raise ValueError(
+            f"Template path is not a directory: {template_dir}"
+        )
+    
+    # Validate site URL format
+    site_url = config.get("siteUrl", "")
+    if not site_url.startswith(("http://", "https://")):
+        raise ValueError(
+            f"Invalid siteUrl: {site_url}\n"
+            f"Must start with http:// or https://"
+        )
+    
+    return config
+
+
 def load_manifest(config_path=None):
     """Load the publish manifest from the config directory."""
     config_dir = find_config_dir(config_path)
@@ -707,6 +777,13 @@ def main():
 
     # Load configuration
     config = load_config(args.config, args)
+    
+    # Validate configuration for security and correctness
+    try:
+        config = validate_config(config)
+    except ValueError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     folder_name = config["notesFolderName"]
     template_dir = config["templateDirectory"]
