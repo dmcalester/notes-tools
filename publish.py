@@ -843,6 +843,17 @@ def main():
 
     # Get manifest notes for comparison
     manifest_notes = manifest.get("notes", {}) if manifest else {}
+    
+    # Pre-compute slugs for all notes (avoid redundant generation)
+    for note in all_notes:
+        identifier = note["identifier"]
+        folder_path = note.get("folder_path", [])
+        
+        # Use manifest path if available, otherwise generate
+        if identifier in manifest_notes:
+            note["slug"] = manifest_notes[identifier].lstrip("/")
+        else:
+            note["slug"] = generate_slug(note["title"], folder_path)
 
     # Check for moved notes BEFORE filtering (path changed from what's in manifest)
     moved_notes = []
@@ -851,8 +862,7 @@ def main():
             identifier = note["identifier"]
             if identifier in manifest_notes:
                 old_path = manifest_notes[identifier]
-                folder_path = note.get("folder_path", [])
-                new_path = f"/{generate_slug(note['title'], folder_path)}"
+                new_path = f"/{note['slug']}"
                 if old_path != new_path:
                     moved_notes.append(
                         {
@@ -903,32 +913,23 @@ def main():
     else:
         notes = all_notes
 
-    # Build note lookup for link resolution
-    # Use manifest paths if available (faster), otherwise compute from notes
-
+    # Build note lookup for link resolution and check for collisions
+    # (slugs already pre-computed above)
     note_lookup = {}
+    slug_to_notes = {}
+    
     for note in all_notes:
         title = note["title"]
         identifier = note["identifier"]
-
-        # Use manifest path if available, otherwise compute
-        if identifier in manifest_notes:
-            slug = manifest_notes[identifier].lstrip("/")
-        else:
-            folder_path = note.get("folder_path", [])
-            slug = generate_slug(title, folder_path)
+        slug = note["slug"]  # Use pre-computed slug
 
         note_lookup[title] = {
             "slug": slug,
             "creationDate": note["creation_date"],
             "identifier": identifier,
         }
-
-    # Check for slug collisions (same title in same folder)
-    slug_to_notes = {}
-    for note in all_notes:
-        folder_path = note.get("folder_path", [])
-        slug = generate_slug(note["title"], folder_path)
+        
+        # Check for collision while building
         if slug in slug_to_notes:
             existing = slug_to_notes[slug]
             print(
@@ -954,8 +955,7 @@ def main():
     for note in notes:
         title = note["title"]
         creation_date = note["creation_date"]
-        folder_path = note.get("folder_path", [])
-        slug = generate_slug(title, folder_path)
+        slug = note["slug"]  # Use pre-computed slug
         datetime_str = format_datetime(creation_date)
         human_date = format_date(creation_date)
 
@@ -1011,8 +1011,7 @@ def main():
             identifier = note["identifier"]
             title = note["title"]
             creation_date = note["creation_date"]
-            folder_path = note.get("folder_path", [])
-            slug = generate_slug(title, folder_path)
+            slug = note["slug"]  # Use pre-computed slug
             
             # Try to use cached snippet if available
             if identifier in cached_snippets:
@@ -1086,14 +1085,13 @@ def main():
         identifier = note["identifier"]
         # Find this note in posts array (if it was processed)
         for post in posts:
-            if post["slug"] == generate_slug(note["title"], note.get("folder_path", [])):
+            if post["slug"] == note["slug"]:  # Use pre-computed slug
                 posts_by_id[identifier] = post
                 break
     
     for note in all_notes:
         identifier = note["identifier"]
-        folder_path = note.get("folder_path", [])
-        slug = generate_slug(note["title"], folder_path)
+        slug = note["slug"]  # Use pre-computed slug
         notes_paths[identifier] = f"/{slug}"
         
         # Cache snippet data for this note
