@@ -327,6 +327,12 @@ def extract_style_runs(data: bytes, text: str) -> list:
                             run["is_strikethrough"] = bool(aval)
                         elif afn == 8:  # Blockquote flag
                             run["is_blockquote"] = bool(aval)
+                        elif afn == 9:  # Link URL (sometimes nested in attributes)
+                            if isinstance(aval, bytes):
+                                try:
+                                    run["link_url"] = aval.decode("utf-8")
+                                except UnicodeDecodeError:
+                                    pass
                 elif sfn == 5:  # Text style (bold/italic)
                     run["text_style"] = sval
                 elif sfn == 8:  # Superscript (at style run level, not inside a2)

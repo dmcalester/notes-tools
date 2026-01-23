@@ -242,9 +242,20 @@ def slugify(text):
     return slug.strip("-")
 
 
-def generate_slug(title, folder_path=None):
-    """Generate URL slug from title and folder path: Folder/Subfolder/title-slug"""
+def generate_slug(title, folder_path=None, creation_date=None):
+    """
+    Generate URL slug from title and path.
+
+    If creation_date is provided, uses year/month structure: 2025/12/title-slug
+    Otherwise uses folder_path if provided: Folder/Subfolder/title-slug
+    """
     title_slug = slugify(title)
+
+    # Prefer date-based path if creation_date is provided
+    if creation_date:
+        year = creation_date.strftime("%Y")
+        month = creation_date.strftime("%m")
+        return f"{year}/{month}/{title_slug}"
 
     if folder_path:
         # Slugify each folder name in the path
@@ -343,13 +354,11 @@ def format_run_as_html(run, text, note_lookup, slug):
     if run.is_italic:
         html = f"<em>{html}</em>"
 
-    if run.is_underline:
-        html = f"<u>{html}</u>"
-
     if run.is_strikethrough:
         html = f"<s>{html}</s>"
 
-    # Handle links
+    # Handle links BEFORE underline - linked text in Notes is often underlined,
+    # and we style links via CSS. Only apply <u> if there's no link.
     if run.link_url:
         if run.link_url.startswith("applenotes:note/"):
             # Internal note link - resolve to slug
@@ -361,12 +370,13 @@ def format_run_as_html(run, text, note_lookup, slug):
                     break
             if target_slug:
                 html = f'<a href="/{target_slug}.html">{html}</a>'
-            else:
-                # Link to unknown note, just show text
-                pass
+            # If link to unknown note, just show text without link
         else:
             # External link
             html = f'<a href="{run.link_url}">{html}</a>'
+    elif run.is_underline:
+        # Only apply underline if there's no link URL
+        html = f"<u>{html}</u>"
 
     return html
 
@@ -571,13 +581,11 @@ def format_merged_run_as_html(merged_run, note_lookup, slug):
     if run.is_italic:
         html = f"<em>{html}</em>"
 
-    if run.is_underline:
-        html = f"<u>{html}</u>"
-
     if run.is_strikethrough:
         html = f"<s>{html}</s>"
 
-    # Handle links
+    # Handle links BEFORE underline - linked text in Notes is often underlined,
+    # and we style links via CSS. Only apply <u> if there's no link.
     if run.link_url:
         if run.link_url.startswith("applenotes:note/"):
             # Internal note link - resolve to slug
@@ -592,6 +600,9 @@ def format_merged_run_as_html(merged_run, note_lookup, slug):
         else:
             # External link
             html = f'<a href="{run.link_url}">{html}</a>'
+    elif run.is_underline:
+        # Only apply underline if there's no link URL
+        html = f"<u>{html}</u>"
 
     # Add trailing newlines back after formatting
     html += trailing_newlines
@@ -657,11 +668,162 @@ def render_block(block, full_text, note_lookup, slug):
 
 
 def process_footnotes(html, slug):
-    """Process footnote references in the HTML."""
-    # Find superscript numbers that could be footnotes
-    # For now, we just return the html as-is since superscripts are already marked
-    # A more sophisticated version would match footnotes with their definitions
-    return {"content": html, "footer": ""}
+    """
+    Process footnote references in the HTML.
+
+    Finds <sup>N</sup> patterns and wraps them in anchor links.
+    Also handles bare numbers that should be footnotes (when <sup> tags are missing).
+    Extracts footnote definitions from the end of the content and formats them
+    as a proper footer with return links.
+
+    Expected input patterns:
+    - Inline: <sup>1</sup> or bare numbers like "word1" where 1 is a footnote
+    - Definitions: [^1] Footnote text... or numbered items in a footer
+
+    Output structure:
+    - Inline: <a id="slug--footnote-N--anchor" href="#slug--footnote-N"><sup>N</sup></a>
+    - Footer: <footer><ol><li id="slug--footnote-N">text<a class="return" href="#slug--footnote-N--anchor">↩︎</a></li></ol></footer>
+    """
+    import re
+
+    content = html
+
+    # First, check for existing <footer> sections to determine which footnote numbers exist
+    footer_pattern = re.compile(r'<footer>\s*<ol>(.*?)</ol>\s*</footer>', re.DOTALL)
+    footer_match = footer_pattern.search(content)
+
+    # Extract footnote numbers from the footer (if present)
+    footer_footnote_nums = set()
+    if footer_match:
+        footer_content = footer_match.group(1)
+        for id_match in re.finditer(r'id="[^"]*footnote-(\d+)"', footer_content):
+            footer_footnote_nums.add(int(id_match.group(1)))
+
+    # Pattern to find superscript numbers (already wrapped in <sup>)
+    sup_pattern = re.compile(r'<sup>(\d+)</sup>')
+
+    # Replace existing <sup>N</sup> with linked anchors
+    def replace_sup(match):
+        num = match.group(1)
+        anchor_id = f"{slug}--footnote-{num}--anchor"
+        footnote_id = f"{slug}--footnote-{num}"
+        return f'<a id="{anchor_id}" href="#{footnote_id}"><sup>{num}</sup></a>'
+
+    content = sup_pattern.sub(replace_sup, content)
+
+    # If we have footnote numbers from the footer but no <sup> tags were found,
+    # look for bare numbers that might be footnotes
+    # Pattern: word followed by a number that's a known footnote, before punctuation or space
+    if footer_footnote_nums:
+        for num in sorted(footer_footnote_nums):
+            # Only process if this footnote anchor doesn't already exist
+            anchor_id = f"{slug}--footnote-{num}--anchor"
+            if f'id="{anchor_id}"' not in content:
+                # Look for bare number after a word character, before space/punctuation/tag
+                # This handles cases like "JavaScript1" or "word2."
+                bare_num_pattern = re.compile(
+                    rf'(\w)({num})(?=[\s.,;:!?\)<]|</)',
+                    re.MULTILINE
+                )
+
+                def replace_bare_num(match):
+                    before = match.group(1)
+                    footnote_id = f"{slug}--footnote-{num}"
+                    return f'{before}<a id="{anchor_id}" href="#{footnote_id}"><sup>{num}</sup></a>'
+
+                content = bare_num_pattern.sub(replace_bare_num, content, count=1)
+
+    # Look for [^N] style footnote definitions in the content
+    # These can be in their own paragraphs or multiple in one paragraph
+    footnote_defs = {}
+
+    # Pattern 1: Paragraphs that start with or contain [^N] definitions
+    footnote_para_pattern = re.compile(r'<p>(\[\^.+?)</p>', re.DOTALL)
+
+    for para_match in footnote_para_pattern.finditer(content):
+        para_content = para_match.group(1)
+        # Split on [^N] markers to get individual footnotes
+        # Pattern: [^N] followed by text until next [^N] or end
+        footnote_parts = re.split(r'\[\^(\d+)\]\s*', para_content)
+        # Result: ['', '1', 'footnote 1 text', '2', 'footnote 2 text', ...]
+        # Process pairs: number, text
+        i = 1
+        while i < len(footnote_parts) - 1:
+            try:
+                num = int(footnote_parts[i])
+                text = footnote_parts[i + 1].strip()
+                # Remove trailing period if present
+                text = text.rstrip('.')
+                footnote_defs[num] = text
+            except (ValueError, IndexError):
+                pass
+            i += 2
+
+    # Remove the footnote definition paragraphs from content
+    content = footnote_para_pattern.sub('', content)
+
+    # Pattern 2: Inline [^N] markers that should be removed (they're already in the footer)
+    # These appear when footnote markers are in the text like "text [^2] more text"
+    inline_footnote_marker = re.compile(r'\s*\[\^\d+\]\s*')
+    content = inline_footnote_marker.sub(' ', content)
+
+    # Process existing footer if present
+    footer_match = footer_pattern.search(content)
+
+    if footer_match:
+        # Extract existing footer content and fix the IDs/links
+        footer_content = footer_match.group(1)
+
+        # Fix existing <li> items to have proper IDs and return links
+        def fix_li(li_match):
+            li_content = li_match.group(0)
+            # Extract the footnote number from the id if present
+            id_match = re.search(r'id="[^"]*footnote-(\d+)"', li_content)
+            if id_match:
+                num = id_match.group(1)
+                footnote_id = f"{slug}--footnote-{num}"
+                anchor_id = f"{slug}--footnote-{num}--anchor"
+
+                # Update the id attribute
+                li_content = re.sub(r'id="[^"]*"', f'id="{footnote_id}"', li_content)
+
+                # Remove any [^N] markers that appear in the footnote text
+                li_content = re.sub(r'\s*\[\^\d+\]\s*', ' ', li_content)
+
+                # Fix the return link href and add class="return" if missing
+                # Handle various formats of the return link
+                li_content = re.sub(
+                    r'<a\s*(?:class="[^"]*")?\s*href="#[^"]*"[^>]*>↩︎</a>',
+                    f'<a class="return" href="#{anchor_id}">↩︎</a>',
+                    li_content
+                )
+            return li_content
+
+        fixed_footer = re.sub(r'<li[^>]*>.*?</li>', fix_li, footer_content, flags=re.DOTALL)
+
+        # Remove the old footer from content
+        content = footer_pattern.sub('', content)
+
+        # Build the new footer
+        footer_html = f'<footer>\n<ol>\n{fixed_footer}</ol>\n</footer>'
+    elif footnote_defs:
+        # Build footer from extracted definitions
+        footer_items = []
+        for num in sorted(footnote_defs.keys()):
+            text = footnote_defs[num]
+            footnote_id = f"{slug}--footnote-{num}"
+            anchor_id = f"{slug}--footnote-{num}--anchor"
+            footer_items.append(
+                f'<li id="{footnote_id}">{text}<a class="return" href="#{anchor_id}">↩︎</a></li>'
+            )
+        footer_html = '<footer>\n<ol>\n' + '\n'.join(footer_items) + '\n</ol>\n</footer>'
+    else:
+        footer_html = ""
+
+    # Clean up any extra whitespace
+    content = re.sub(r'\n{3,}', '\n\n', content.strip())
+
+    return {"content": content, "footer": footer_html}
 
 
 # --- Template Engine ---
@@ -889,12 +1051,14 @@ def main():
     for note in all_notes:
         identifier = note["identifier"]
         folder_path = note.get("folder_path", [])
-        
+        creation_date = note.get("creation_date")
+
         # Use manifest path if available, otherwise generate
         if identifier in manifest_notes:
             note["slug"] = manifest_notes[identifier].lstrip("/")
         else:
-            note["slug"] = generate_slug(note["title"], folder_path)
+            # Use date-based path structure: year/month/title-slug
+            note["slug"] = generate_slug(note["title"], folder_path, creation_date)
 
     # Check for moved notes BEFORE filtering (path changed from what's in manifest)
     moved_notes = []
